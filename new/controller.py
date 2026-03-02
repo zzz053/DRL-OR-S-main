@@ -2,6 +2,7 @@ import time
 import json
 import socket
 import logging
+import os
 
 import netifaces
 from ryu.base import app_manager
@@ -20,15 +21,21 @@ from operator import attrgetter
 Initial_bandwidth = 800
 
 # 配置日志：同时输出到控制台和本地文件 controller.log
+# 注意：ryu 可能会预先配置 logging，basicConfig 在这种情况下可能不生效，导致日志文件为空。
+LOG_FORMAT = '%(asctime)s [%(levelname)s] %(message)s'
+LOG_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'controller.log')
+
 logging.basicConfig(
     level=logging.DEBUG,
-    format='%(asctime)s [%(levelname)s] %(message)s',
+    format=LOG_FORMAT,
     handlers=[
-        logging.StreamHandler(),  # 输出到控制台
-        logging.FileHandler("./controller.log", mode='w', encoding='utf-8'),  # 输出到文件
-    ]
+        logging.StreamHandler(),
+        logging.FileHandler(LOG_FILE, mode='w', encoding='utf-8'),
+    ],
+    force=True,
 )
-logger = logging.getLogger("server_agent")
+logger = logging.getLogger('server_agent')
+logger.setLevel(logging.DEBUG)
 
 # 添加server配置
 SERVER_CONFIG = {
@@ -69,6 +76,17 @@ class TopoAwareness(app_manager.RyuApp):
 
     def __init__(self, *args, **kwargs):
         super(TopoAwareness, self).__init__(*args, **kwargs)
+        # 统一使用文件日志 handler，避免 self.logger 仅输出到控制台导致 controller.log 为空
+        file_handler_exists = any(
+            isinstance(h, logging.FileHandler) and getattr(h, 'baseFilename', '') == LOG_FILE
+            for h in self.logger.handlers
+        )
+        if not file_handler_exists:
+            file_handler = logging.FileHandler(LOG_FILE, mode='a', encoding='utf-8')
+            file_handler.setFormatter(logging.Formatter(LOG_FORMAT))
+            file_handler.setLevel(logging.DEBUG)
+            self.logger.addHandler(file_handler)
+        self.logger.setLevel(logging.DEBUG)
         self.name = 'topo_awareness'
         self.topology_api_app = self  # 将当前实例赋值给属性
         self.local_mac = ''
