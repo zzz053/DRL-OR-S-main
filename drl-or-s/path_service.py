@@ -166,6 +166,61 @@ class DRLPathService:
 
 
 
+
+    def _reset_env_with_request(self, src_node, dst_node, rtype=0, demand=100, duration=50):
+        """按指定请求重建环境状态，避免 env.reset() 生成随机请求导致观测与请求不一致。"""
+        # reset dynamic status
+        self.env._time_step = 0
+        self.env._request_heapq = []
+        self.env._link_usage = [([0.] * self.num_node) for _ in range(self.num_node)]
+        self.env._delay_normal = [([1.] * self.num_node) for _ in range(self.num_node)]
+        self.env._loss_normal = [([1.] * self.num_node) for _ in range(self.num_node)]
+
+        import random as _random
+        import numpy as _np
+
+        orig_random_sample = _random.sample
+        orig_random_choice = _random.choice
+        orig_np_choice = _np.random.choice
+        try:
+            def _fixed_sample(population, k):
+                return [src_node, dst_node]
+
+            def _fixed_choice(seq):
+                # _update_state 内部会对 request_demands/request_times 调用 random.choice
+                if isinstance(seq, (list, tuple)) and len(seq) > 0:
+                    return seq[0]
+                return orig_random_choice(seq)
+
+            def _fixed_np_choice(a, p=None):
+                # 仅用于选择 rtype
+                if hasattr(a, '__iter__'):
+                    return rtype
+                return orig_np_choice(a, p=p)
+
+            _random.sample = _fixed_sample
+            _random.choice = _fixed_choice
+            _np.random.choice = _fixed_np_choice
+
+            # 通过 pre_train=True 走 random.sample 分支，确保 s,t 可控
+            self.env._update_state(pre_train=True)
+
+            # 强制覆盖请求关键字段（防御式）
+            self.env._request.s = src_node
+            self.env._request.t = dst_node
+            self.env._request.rtype = rtype
+            self.env._request.demand = demand
+            self.env._request.start_time = 0
+            self.env._request.end_time = duration
+
+            return self.env._request, self.env._states
+        finally:
+            _random.sample = orig_random_sample
+            _random.choice = orig_random_choice
+            _np.random.choice = orig_np_choice
+
+
+
     def _sanitize_path(self, path, src_node, dst_node):
         """
         清洗 DRL 生成路径，避免环路/断链导致的重复包和高时延。
@@ -221,9 +276,7 @@ class DRLPathService:
             return self.env.calcSHR(src_node, dst_node)
 
         try:
-            _tmp_req, obses = self.env.reset()
-            request = Request(src_node, dst_node, 0, 100, 100, 0)
-            self.env._request = request
+            request, obses = self._reset_env_with_request(src_node, dst_node, rtype=0, demand=100, duration=50)
 
             path = [src_node]
             curr_path = [0] * self.num_node

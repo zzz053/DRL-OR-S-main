@@ -128,6 +128,7 @@ class TopoAwareness(app_manager.RyuApp):
         #各种标志位的开关
         self.show_enable = True  # 控制show方法的开关，True为开启，False为关闭
         self.host_migration_log_enable = True  # 控制主机迁移相关日志的开关
+        self.strict_host_binding = True  # 严格校验主机归属（hN 仅应接在 sN）
         self.ip_packet_log_enable = False  # 控制IP数据包日志的开关
         
         # 获取switches实例，用于访问PortData中的时间戳和echo延迟
@@ -1816,6 +1817,20 @@ class TopoAwareness(app_manager.RyuApp):
     # 发现主机，存主机信息（存host_to_sw_port里）
     # ==================== 修复后的主机学习逻辑 ====================
     
+    def _is_valid_host_attachment(self, dpid, src_mac, src_ip):
+        """
+        校验主机归属，避免环路报文导致的“主机迁移抖动”。
+        在 testbed 默认拓扑中：hN(ip=10.0.0.N, mac尾字节=N) 连接到 sN(dpid=N)。
+        """
+        if not self.strict_host_binding:
+            return True
+        try:
+            ip_idx = int(src_ip.split('.')[-1])
+            mac_idx = int(src_mac.split(':')[-1], 16)
+            return (ip_idx == mac_idx == int(dpid))
+        except Exception:
+            return False
+
     @set_ev_cls(ofp_event.EventOFPPacketIn, MAIN_DISPATCHER)
     def _host_arp_packet_in_handle(self, ev):
         """
@@ -1842,6 +1857,10 @@ class TopoAwareness(app_manager.RyuApp):
         if opcode not in [arp.ARP_REQUEST, arp.ARP_REPLY]:
             return
         if self.is_link_port(dpid, in_port):
+            return
+
+        # 严格主机绑定校验：过滤掉环路/泛洪带来的伪迁移学习
+        if not self._is_valid_host_attachment(dpid, src_mac, src_ip):
             return
         
         # 【核心修复】直接学习，不再使用 pending_host_learning
