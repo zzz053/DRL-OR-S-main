@@ -2,6 +2,7 @@ import time
 import json
 import socket
 import logging
+import os
 
 import netifaces
 from ryu.base import app_manager
@@ -20,15 +21,21 @@ from operator import attrgetter
 Initial_bandwidth = 800
 
 # 配置日志：同时输出到控制台和本地文件 controller.log
+# 注意：ryu 可能会预先配置 logging，basicConfig 在这种情况下可能不生效，导致日志文件为空。
+LOG_FORMAT = '%(asctime)s [%(levelname)s] %(message)s'
+LOG_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'controller.log')
+
 logging.basicConfig(
-    level=logging.DEBUG,
-    format='%(asctime)s [%(levelname)s] %(message)s',
+    level=logging.INFO,
+    format=LOG_FORMAT,
     handlers=[
-        logging.StreamHandler(),  # 输出到控制台
-        logging.FileHandler("./controller.log", mode='w', encoding='utf-8'),  # 输出到文件
-    ]
+        logging.StreamHandler(),
+        logging.FileHandler(LOG_FILE, mode='w', encoding='utf-8'),
+    ],
+    force=True,
 )
-logger = logging.getLogger("server_agent")
+logger = logging.getLogger('server_agent')
+logger.setLevel(logging.INFO)
 
 # 添加server配置
 SERVER_CONFIG = {
@@ -69,6 +76,17 @@ class TopoAwareness(app_manager.RyuApp):
 
     def __init__(self, *args, **kwargs):
         super(TopoAwareness, self).__init__(*args, **kwargs)
+        # 统一使用文件日志 handler，避免 self.logger 仅输出到控制台导致 controller.log 为空
+        file_handler_exists = any(
+            isinstance(h, logging.FileHandler) and getattr(h, 'baseFilename', '') == LOG_FILE
+            for h in self.logger.handlers
+        )
+        if not file_handler_exists:
+            file_handler = logging.FileHandler(LOG_FILE, mode='a', encoding='utf-8')
+            file_handler.setFormatter(logging.Formatter(LOG_FORMAT))
+            file_handler.setLevel(logging.INFO)
+            self.logger.addHandler(file_handler)
+        self.logger.setLevel(logging.INFO)
         self.name = 'topo_awareness'
         self.topology_api_app = self  # 将当前实例赋值给属性
         self.local_mac = ''
@@ -110,6 +128,9 @@ class TopoAwareness(app_manager.RyuApp):
         #各种标志位的开关
         self.show_enable = True  # 控制show方法的开关，True为开启，False为关闭
         self.host_migration_log_enable = True  # 控制主机迁移相关日志的开关
+        self.strict_host_binding = False  # 默认关闭严格绑定，避免拓扑发现早期误丢弃合法学习
+        self.startup_grace_seconds = 8  # 启动早期链路角色尚未收敛，暂不做主机学习
+        self.controller_start_time = time.time()
         self.ip_packet_log_enable = False  # 控制IP数据包日志的开关
         
         # 获取switches实例，用于访问PortData中的时间戳和echo延迟
@@ -1798,6 +1819,20 @@ class TopoAwareness(app_manager.RyuApp):
     # 发现主机，存主机信息（存host_to_sw_port里）
     # ==================== 修复后的主机学习逻辑 ====================
     
+    def _is_valid_host_attachment(self, dpid, src_mac, src_ip):
+        """
+        校验主机归属，避免环路报文导致的“主机迁移抖动”。
+        在 testbed 默认拓扑中：hN(ip=10.0.0.N, mac尾字节=N) 连接到 sN(dpid=N)。
+        """
+        if not self.strict_host_binding:
+            return True
+        try:
+            ip_idx = int(src_ip.split('.')[-1])
+            mac_idx = int(src_mac.split(':')[-1], 16)
+            return (ip_idx == mac_idx == int(dpid))
+        except Exception:
+            return False
+
     @set_ev_cls(ofp_event.EventOFPPacketIn, MAIN_DISPATCHER)
     def _host_arp_packet_in_handle(self, ev):
         """
@@ -1824,6 +1859,14 @@ class TopoAwareness(app_manager.RyuApp):
         if opcode not in [arp.ARP_REQUEST, arp.ARP_REPLY]:
             return
         if self.is_link_port(dpid, in_port):
+            return
+
+        # 启动初期拓扑/链路端口尚未稳定，避免误学习导致主机迁移抖动
+        if time.time() - self.controller_start_time < self.startup_grace_seconds:
+            return
+
+        # 严格主机绑定校验：可选过滤环路/泛洪带来的伪迁移学习
+        if not self._is_valid_host_attachment(dpid, src_mac, src_ip):
             return
         
         # 【核心修复】直接学习，不再使用 pending_host_learning
@@ -1964,6 +2007,11 @@ class TopoAwareness(app_manager.RyuApp):
 
         # 过滤无效IP
         if src_ip == "0.0.0.0":
+            return
+
+        # 仅处理交换机间链路端口的数据包；主机侧流量由 _host_arp_packet_in_handle/_host_ip_packet_in_handle 处理。
+        # 否则会出现同一个 PacketIn 被多处理器重复处理，造成重复泛洪、伪迁移与高时延/DUP。
+        if not self.is_link_port(dpid, in_port):
             return
 
         # ============ 关键修复4: 不在这里学习主机 ============

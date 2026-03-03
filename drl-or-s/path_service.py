@@ -164,15 +164,116 @@ class DRLPathService:
             f"节点数: {num_node}, Agent数: {num_agent}"
         )
 
+
+
+    def _reset_env_with_request(self, src_node, dst_node, rtype=0, demand=100, duration=50):
+        """按指定请求重建环境状态，避免 env.reset() 生成随机请求导致观测与请求不一致。"""
+        # reset dynamic status
+        self.env._time_step = 0
+        self.env._request_heapq = []
+        self.env._link_usage = [([0.] * self.num_node) for _ in range(self.num_node)]
+        self.env._delay_normal = [([1.] * self.num_node) for _ in range(self.num_node)]
+        self.env._loss_normal = [([1.] * self.num_node) for _ in range(self.num_node)]
+
+        import random as _random
+        import numpy as _np
+
+        orig_random_sample = _random.sample
+        orig_random_choice = _random.choice
+        orig_np_choice = _np.random.choice
+        try:
+            def _fixed_sample(population, k):
+                return [src_node, dst_node]
+
+            def _fixed_choice(seq):
+                # _update_state 内部会对 request_demands/request_times 调用 random.choice
+                if isinstance(seq, (list, tuple)) and len(seq) > 0:
+                    return seq[0]
+                return orig_random_choice(seq)
+
+            def _fixed_np_choice(a, p=None):
+                # 仅用于选择 rtype
+                if hasattr(a, '__iter__'):
+                    return rtype
+                return orig_np_choice(a, p=p)
+
+            _random.sample = _fixed_sample
+            _random.choice = _fixed_choice
+            _np.random.choice = _fixed_np_choice
+
+            # 通过 pre_train=True 走 random.sample 分支，确保 s,t 可控
+            self.env._update_state(pre_train=True)
+
+            # 强制覆盖请求关键字段（防御式）
+            self.env._request.s = src_node
+            self.env._request.t = dst_node
+            self.env._request.rtype = rtype
+            self.env._request.demand = demand
+            self.env._request.start_time = 0
+            self.env._request.end_time = duration
+
+            return self.env._request, self.env._states
+        finally:
+            _random.sample = orig_random_sample
+            _random.choice = orig_random_choice
+            _np.random.choice = orig_np_choice
+
+    def _sanitize_path(self, path, src_node, dst_node):
+        """
+        清洗 DRL 生成路径，避免环路/断链导致的重复包和高时延。
+        规则：
+        1) 保证起点/终点正确
+        2) 消除环（保留简单路径）
+        3) 校验相邻节点是否存在物理链路
+        4) 任一步失败则回退最短路径
+        """
+        if not path:
+            return self.env.calcSHR(src_node, dst_node)
+
+        # 强制起点
+        if path[0] != src_node:
+            path = [src_node] + [n for n in path if n != src_node]
+
+        # 消环：如果再次遇到旧节点，删除中间成环片段
+        simple_path = []
+        pos = {}
+        for node in path:
+            if node in pos:
+                keep = pos[node] + 1
+                simple_path = simple_path[:keep]
+                pos = {n: i for i, n in enumerate(simple_path)}
+            else:
+                pos[node] = len(simple_path)
+                simple_path.append(node)
+
+        path = simple_path
+
+        # 强制终点：若未到达则补最短路尾段
+        if path[-1] != dst_node:
+            tail = self.env.calcSHR(path[-1], dst_node)
+            if tail and len(tail) > 1:
+                path.extend(tail[1:])
+
+        # 最终校验：必须是有效简单路径，且相邻节点有链路
+        if len(path) != len(set(path)):
+            return self.env.calcSHR(src_node, dst_node)
+
+        for u, v in zip(path[:-1], path[1:]):
+            if v not in self.env._link_lists[u]:
+                return self.env.calcSHR(src_node, dst_node)
+
+        if path[0] != src_node or path[-1] != dst_node:
+            return self.env.calcSHR(src_node, dst_node)
+
+        return path
+
     def compute_path_with_drl(self, src_node, dst_node):
         """使用 DRL 模型计算路径"""
         if self.actor_critic is None:
             return self.env.calcSHR(src_node, dst_node)
 
         try:
-            _tmp_req, obses = self.env.reset()
-            request = Request(src_node, dst_node, 0, 100, 100, 0)
-            self.env._request = request
+            request, obses = self._reset_env_with_request(src_node, dst_node, rtype=0, demand=100, duration=50)
 
             path = [src_node]
             curr_path = [0] * self.num_node
@@ -185,7 +286,7 @@ class DRLPathService:
                     curr_path[k] = 1
 
             if dst_node in path:
-                return path
+                return self._sanitize_path(path, src_node, dst_node)
 
             agents_flag = [0] * self.num_agent
             deterministic = True
@@ -255,7 +356,7 @@ class DRLPathService:
                 if remaining and len(remaining) > 1:
                     path.extend(remaining[1:])
 
-            return path
+            return self._sanitize_path(path, src_node, dst_node)
 
         except Exception as e:
             print(f"[DRL] ✗ 计算失败: {e}")
