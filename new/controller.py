@@ -26,7 +26,7 @@ LOG_FORMAT = '%(asctime)s [%(levelname)s] %(message)s'
 LOG_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'controller.log')
 
 logging.basicConfig(
-    level=logging.DEBUG,
+    level=logging.INFO,
     format=LOG_FORMAT,
     handlers=[
         logging.StreamHandler(),
@@ -35,7 +35,7 @@ logging.basicConfig(
     force=True,
 )
 logger = logging.getLogger('server_agent')
-logger.setLevel(logging.DEBUG)
+logger.setLevel(logging.INFO)
 
 # 添加server配置
 SERVER_CONFIG = {
@@ -84,9 +84,9 @@ class TopoAwareness(app_manager.RyuApp):
         if not file_handler_exists:
             file_handler = logging.FileHandler(LOG_FILE, mode='a', encoding='utf-8')
             file_handler.setFormatter(logging.Formatter(LOG_FORMAT))
-            file_handler.setLevel(logging.DEBUG)
+            file_handler.setLevel(logging.INFO)
             self.logger.addHandler(file_handler)
-        self.logger.setLevel(logging.DEBUG)
+        self.logger.setLevel(logging.INFO)
         self.name = 'topo_awareness'
         self.topology_api_app = self  # 将当前实例赋值给属性
         self.local_mac = ''
