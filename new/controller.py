@@ -128,7 +128,9 @@ class TopoAwareness(app_manager.RyuApp):
         #各种标志位的开关
         self.show_enable = True  # 控制show方法的开关，True为开启，False为关闭
         self.host_migration_log_enable = True  # 控制主机迁移相关日志的开关
-        self.strict_host_binding = True  # 严格校验主机归属（hN 仅应接在 sN）
+        self.strict_host_binding = False  # 默认关闭严格绑定，避免拓扑发现早期误丢弃合法学习
+        self.startup_grace_seconds = 8  # 启动早期链路角色尚未收敛，暂不做主机学习
+        self.controller_start_time = time.time()
         self.ip_packet_log_enable = False  # 控制IP数据包日志的开关
         
         # 获取switches实例，用于访问PortData中的时间戳和echo延迟
@@ -1859,7 +1861,11 @@ class TopoAwareness(app_manager.RyuApp):
         if self.is_link_port(dpid, in_port):
             return
 
-        # 严格主机绑定校验：过滤掉环路/泛洪带来的伪迁移学习
+        # 启动初期拓扑/链路端口尚未稳定，避免误学习导致主机迁移抖动
+        if time.time() - self.controller_start_time < self.startup_grace_seconds:
+            return
+
+        # 严格主机绑定校验：可选过滤环路/泛洪带来的伪迁移学习
         if not self._is_valid_host_attachment(dpid, src_mac, src_ip):
             return
         
