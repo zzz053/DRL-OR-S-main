@@ -166,6 +166,7 @@ class DRLPathService:
 
 
 
+
     def _reset_env_with_request(self, src_node, dst_node, rtype=0, demand=100, duration=50):
         """按指定请求重建环境状态，避免 env.reset() 生成随机请求导致观测与请求不一致。"""
         # reset dynamic status
@@ -217,6 +218,8 @@ class DRLPathService:
             _random.sample = orig_random_sample
             _random.choice = orig_random_choice
             _np.random.choice = orig_np_choice
+
+
 
     def _sanitize_path(self, path, src_node, dst_node):
         """
