@@ -2009,6 +2009,11 @@ class TopoAwareness(app_manager.RyuApp):
         if src_ip == "0.0.0.0":
             return
 
+        # 仅处理交换机间链路端口的数据包；主机侧流量由 _host_arp_packet_in_handle/_host_ip_packet_in_handle 处理。
+        # 否则会出现同一个 PacketIn 被多处理器重复处理，造成重复泛洪、伪迁移与高时延/DUP。
+        if not self.is_link_port(dpid, in_port):
+            return
+
         # ============ 关键修复4: 不在这里学习主机 ============
         # 主机学习已经在 _host_arp_packet_in_handle 中完成
         # 这里只负责MAC地址到端口的映射（用于转发）
