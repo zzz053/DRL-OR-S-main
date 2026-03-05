@@ -1,6 +1,6 @@
 from __future__ import print_function
 from mininet.net import Mininet
-from mininet.node import Controller, RemoteController, OVSSwitch
+from mininet.node import Controller, RemoteController, OVSSwitch, OVSKernelSwitch
 from mininet.cli import CLI
 from mininet.log import setLogLevel, info
 from mininet.link import Link, Intf, TCLink
@@ -17,7 +17,7 @@ import sys
 
 class CustomTopo(Topo):
     def __init__(self, nodeNum, linkSet, bandwidths, losses, **opts):
-        Topo.__init__(self,**opts)
+        Topo.__init__(self, **opts)
         self.__nodenum = nodeNum
         self.__linkset = linkSet
         self.__bandwidths = bandwidths
@@ -26,17 +26,51 @@ class CustomTopo(Topo):
         self.__switches = []
         self.__hosts = []
 
+        # 端口规划：
+        # - 1-10: 交换机间链路端口
+        # - 11 : 主机接入端口（每个交换机 1 台主机）
+        self._core_port_base = 1
+        self._host_port_id = 11
+        self._next_core_port = [self._core_port_base] * self.__nodenum
+
         self.create_net()
         self.add_hosts()
 
     '''create the network topo'''
     def create_net(self):
         for i in range(self.__nodenum):
-            self.__switches.append(self.addSwitch("s" + str(i + 1)))
+            dpid = "%016x" % (i + 1)
+            self.__switches.append(
+                self.addSwitch(
+                    "s" + str(i + 1),
+                    dpid=dpid,
+                    protocols='OpenFlow13',
+                    cls=OVSKernelSwitch,
+                )
+            )
+
+        # 显式为交换机间链路分配端口号，保持 Topology.txt 中带宽/丢包率不变
         for i in range(len(self.__linkset)):
             node1 = self.__linkset[i][0]
             node2 = self.__linkset[i][1]
-            self.addLink(self.__switches[node1], self.__switches[node2], bw=self.__bandwidths[i], delay='5ms', loss=self.__losses[i], max_queue_size=100) 
+            sw1 = self.__switches[node1]
+            sw2 = self.__switches[node2]
+
+            port1 = self._next_core_port[node1]
+            port2 = self._next_core_port[node2]
+            self._next_core_port[node1] += 1
+            self._next_core_port[node2] += 1
+
+            self.addLink(
+                sw1,
+                sw2,
+                port1=port1,
+                port2=port2,
+                bw=self.__bandwidths[i],
+                delay='5ms',
+                loss=self.__losses[i],
+                max_queue_size=100,
+            )
     
     '''add host for each switch(node)'''
     def add_hosts(self):
@@ -44,8 +78,22 @@ class CustomTopo(Topo):
             print("ERROR!!!")
             exit()
         for i in range(self.__nodenum):
-            self.__hosts.append(self.addHost("h" + str(i + 1), mac=("00:00:00:00:00:%02x" % (i + 1)), ip = "10.0.0." + str(i + 1)))
-            self.addLink(self.__switches[i], self.__hosts[i], bw=1000, delay='0ms', max_queue_size=10000) # bw here should be large enough
+            host = self.addHost(
+                "h" + str(i + 1),
+                mac=("00:00:00:00:00:%02x" % (i + 1)),
+                ip="10.0.0." + str(i + 1),
+            )
+            self.__hosts.append(host)
+            # 主机统一接在端口 11 上，避免与链路端口冲突
+            self.addLink(
+                self.__switches[i],
+                host,
+                port1=self._host_port_id,
+                port2=1,
+                bw=1000,
+                delay='0ms',
+                max_queue_size=10000,
+            )  # bw here should be large enough
         
 
 def generate_request(net, src, src_port, dst, dst_port, rtype, demand, rtime, time_step): 
