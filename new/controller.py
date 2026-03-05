@@ -128,7 +128,7 @@ class TopoAwareness(app_manager.RyuApp):
         #各种标志位的开关
         self.show_enable = True  # 控制show方法的开关，True为开启，False为关闭
         self.host_migration_log_enable = True  # 控制主机迁移相关日志的开关
-        self.strict_host_binding = False  # 默认关闭严格绑定，避免拓扑发现早期误丢弃合法学习
+        self.strict_host_binding = True   # True：testbed 中 10.0.0.N 仅在学习到 dpid=N 时接受，避免 ARP 经多跳后被误学导致主机迁移与错误路径请求
         self.startup_grace_seconds = 8  # 启动早期链路角色尚未收敛，暂不做主机学习
         self.controller_start_time = time.time()
         self.ip_packet_log_enable = False  # 控制IP数据包日志的开关
@@ -1233,9 +1233,16 @@ class TopoAwareness(app_manager.RyuApp):
             self.add_flow(src_datapath, priority, src_match_reverse, src_actions_reverse,
                          idle_timeout=idle_timeout, hard_timeout=hard_timeout)
             
-            # 发送当前数据包
+            # 发送当前数据包：仅当 PacketIn 发生在源交换机时从源交换机发；否则从目标交换机发向主机
             if msg:
-                self.send_packet_to_outport(src_datapath, msg, src_in_port, src_actions)
+                if msg.datapath.id == path[0]:
+                    self.send_packet_to_outport(src_datapath, msg, src_in_port, src_actions)
+                elif msg.datapath.id == path[1]:
+                    dst_act = [dst_datapath.ofproto_parser.OFPActionSetField(eth_dst=dst_mac_addr),
+                               dst_datapath.ofproto_parser.OFPActionOutput(dst_out_port)]
+                    in_port_at_dst = self.get_port_from_link(path[1], path[0])
+                    if in_port_at_dst is not None:
+                        self.send_packet_to_outport(dst_datapath, msg, in_port_at_dst, dst_act)
                 
             self.logger.info("【流表】两交换机流表安装完成: 源IP=%s, 目标IP=%s, 路径=%s", src_ip, dst_ip, path)
         else:
@@ -1268,8 +1275,8 @@ class TopoAwareness(app_manager.RyuApp):
                         self.add_flow(datapath, priority, match_reverse, actions_reverse,
                                      idle_timeout=idle_timeout, hard_timeout=hard_timeout)
                         
-                        # 发送当前数据包
-                        if msg:
+                        # 仅当 PacketIn 就发生在源交换机时，从源交换机发出当前包；否则在循环后从实际持有报文的交换机发出
+                        if msg and msg.datapath.id == path[0]:
                             self.send_packet_to_outport(datapath, msg, in_port, actions)
                         
                     elif i == num - 1:  # 最后一个交换机（目标交换机）
@@ -1327,6 +1334,20 @@ class TopoAwareness(app_manager.RyuApp):
                                                            dst_port, src_port, proto)
                         self.add_flow(datapath, priority, match_reverse, actions_reverse,
                                      idle_timeout=idle_timeout, hard_timeout=hard_timeout)
+            
+            # PacketIn 可能发生在路径中间交换机：从实际持有报文的交换机发出
+            if msg and msg.datapath.id != path[0]:
+                try:
+                    cur_id = msg.datapath.id
+                    idx = path.index(cur_id) if cur_id in path else -1
+                    if 0 <= idx < num - 1:
+                        out_port = self.get_port_from_link(cur_id, path[idx + 1])
+                        if out_port is not None:
+                            datapath_cur = self.dpid_to_switch[cur_id]
+                            actions_cur = [datapath_cur.ofproto_parser.OFPActionOutput(out_port)]
+                            self.send_packet_to_outport(datapath_cur, msg, msg.match['in_port'], actions_cur)
+                except (ValueError, KeyError) as e:
+                    self.logger.warning("【流表】从中间交换机转发当前包失败: %s", e)
             
             self.logger.info("【流表】多交换机流表安装完成: 源IP=%s, 目标IP=%s, 路径=%s", src_ip, dst_ip, path)
 
@@ -2009,6 +2030,11 @@ class TopoAwareness(app_manager.RyuApp):
         if src_ip == "0.0.0.0":
             return
 
+        # 仅处理交换机间链路端口的数据包；主机侧流量由 _host_arp_packet_in_handle/_host_ip_packet_in_handle 处理。
+        # 否则会出现同一个 PacketIn 被多处理器重复处理，造成重复泛洪、伪迁移与高时延/DUP。
+        if not self.is_link_port(dpid, in_port):
+            return
+
         # ============ 关键修复4: 不在这里学习主机 ============
         # 主机学习已经在 _host_arp_packet_in_handle 中完成
         # 这里只负责MAC地址到端口的映射（用于转发）
@@ -2211,8 +2237,24 @@ class TopoAwareness(app_manager.RyuApp):
                     # self.logger.error("未连接到server_agent，无法处理跨域请求")
                     return
             
-            # 源交换机ID
-            src_switch_id = dpid
+            # 源交换机ID与源主机端口：必须从 host_to_sw_port 查表得到，不能用当前 dpid
+            # 否则 PacketIn 发生在路径中间交换机时会误用该交换机作为源，导致错误路径请求与主机迁移
+            src_switch_id = None
+            src_host_port = None  # 源主机在 src_switch_id 上的接入端口，供 install_flow_entry 在 path[0] 使用
+            for sw_id in self.host_to_sw_port:
+                for port in self.host_to_sw_port[sw_id]:
+                    for host_info in self.host_to_sw_port[sw_id][port]:
+                        if host_info[1] == src_ip:
+                            src_switch_id = sw_id
+                            src_host_port = port
+                            break
+                    if src_switch_id is not None:
+                        break
+                if src_switch_id is not None:
+                    break
+            if src_switch_id is None:
+                self.logger.debug("源IP %s 尚未学习，忽略本 PacketIn，等待 ARP 学习", src_ip)
+                return
             
             # 特殊处理：如果源交换机和目标交换机是同一个
             if src_switch_id == dst_switch_id:
@@ -2221,7 +2263,7 @@ class TopoAwareness(app_manager.RyuApp):
                 if not dst_port or not dst_mac_addr:
                      return
                 
-                # 创建流表项 - 正向流表
+                # 同一交换机时当前 dpid 即源交换机，入端口用当前 in_port 即可
                 datapath = self.dpid_to_switch[dpid]
                 actions = [datapath.ofproto_parser.OFPActionSetField(eth_dst=dst_mac_addr),
                           datapath.ofproto_parser.OFPActionOutput(dst_port)]
@@ -2247,17 +2289,18 @@ class TopoAwareness(app_manager.RyuApp):
                 return
             
             # 正常处理：源交换机和目标交换机不同
+            # 路径起点为 src_switch_id，入端口必须用该交换机上源主机的端口，不能用当前 PacketIn 的 in_port
             self.logger.info("【计算】路径: 源交换机=%s, 目标交换机=%s", src_switch_id, dst_switch_id)
             path = self.get_path(src_switch_id, dst_switch_id)
+            first_hop_in_port = src_host_port if src_host_port is not None else in_port
             
             if path and len(path) > 0:
                 self.logger.info("【成功】找到路径: %s -> %s, 路径: %s", src_ip, dst_ip, path)
-                self.install_flow_entry(path, src_ip, dst_ip, in_port, msg)
+                self.install_flow_entry(path, src_ip, dst_ip, first_hop_in_port, msg)
             else:
                 self.logger.info("【尝试】未找到最短路径，使用直接路径")
-                # 尝试直接安装流表，即使没有找到路径
                 direct_path = [src_switch_id, dst_switch_id]
-                self.install_flow_entry(direct_path, src_ip, dst_ip, in_port, msg)
+                self.install_flow_entry(direct_path, src_ip, dst_ip, first_hop_in_port, msg)
 
     def _update_link_loss_rate(self, dpid, port_no, loss_rate):
         """
