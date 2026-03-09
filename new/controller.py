@@ -925,14 +925,19 @@ class TopoAwareness(app_manager.RyuApp):
         """
         向交换机下发流表
         Deliver the flow table to the switch
+        
+        🔧 方案A修改2：添加默认超时，避免旧流表残留导致环路
         """
         ofproto = datapath.ofproto
         parser = datapath.ofproto_parser
 
         inst = [parser.OFPInstructionActions(ofproto.OFPIT_APPLY_ACTIONS,
                                              actions)]  # OFPInstructionActions 是一个 OpenFlow 指令，用于定义流表条目匹配后应执行的动作
-        # if proto == 6:
-        #     hard_timeout = 5
+        
+        # 🔧 如果没有指定超时，使用默认值（防止环路）
+        if idle_timeout == 0 and hard_timeout == 0:
+            idle_timeout = 10   # 10秒无流量自动删除
+            hard_timeout = 30   # 30秒强制删除
 
         if buffer_id:
             mod = parser.OFPFlowMod(datapath=datapath, buffer_id=buffer_id,
@@ -1891,62 +1896,34 @@ class TopoAwareness(app_manager.RyuApp):
         """
         检查主机是否迁移，如果是则删除旧位置的记录
         确保MAC地址的唯一性
+        
+        🔧 方案A修改1：禁用主机迁移逻辑，只在首次学习主机
         """
         # 如果新位置本身是链路端口，不应该学习
         if self.is_link_port(new_dpid, new_port):
             return
         
-        # 遍历所有交换机和端口，查找该MAC的旧位置
+        # 🔧 只检查是否已存在，不允许迁移
         for sw_id in list(self.host_to_sw_port.keys()):
             for port in list(self.host_to_sw_port.get(sw_id, {}).keys()):
                 hosts = self.host_to_sw_port[sw_id][port]
                 for h in list(hosts):
                     # 找到相同MAC的记录
                     if h[0] == mac:
-                        # 如果不是同一位置，说明主机迁移了
-                        if sw_id != new_dpid or port != new_port:
-                            is_old_link = self.is_link_port(sw_id, port)
-                            
-                            if self.host_migration_log_enable:
-                                if is_old_link:
-                                    self.logger.warning("【删除错误学习】MAC=%s, IP=%s, 旧位置: dpid=%s, port=%s(链路端口) -> 新位置: dpid=%s, port=%s",
-                                                      mac, ip, sw_id, port, new_dpid, new_port)
-                                else:
-                                    self.logger.info("【主机迁移】MAC=%s, IP=%s, 从 dpid=%s, port=%s -> dpid=%s, port=%s",
-                                                   mac, ip, sw_id, port, new_dpid, new_port)
-                            
-                            # 删除旧位置的主机记录
-                            hosts.remove(h)
-                            
-                            # 如果该端口下没有主机了，删除端口记录
-                            if not hosts:
-                                del self.host_to_sw_port[sw_id][port]
-                            
-                            # 如果交换机没有连接任何主机，清理交换机记录
-                            if not self.host_to_sw_port[sw_id]:
-                                del self.host_to_sw_port[sw_id]
-                            
-                            # 清理mac_to_port
-                            if sw_id in self.mac_to_port and mac in self.mac_to_port[sw_id]:
-                                self.mac_to_port[sw_id][mac].discard(port)
-                                if not self.mac_to_port[sw_id][mac]:
-                                    del self.mac_to_port[sw_id][mac]
-                            
-                            # 清理ARP表
-                            for key in list(self.arp_table.keys()):
-                                if key[0] == sw_id and key[1] == mac:
-                                    del self.arp_table[key]
-                            
-                            # 如果旧位置不是链路端口，说明是正常迁移，可以返回了
-                            if not is_old_link:
-                                return
-                        else:
-                            # 同一位置，但IP可能不同，更新IP
+                        # 如果是同一位置，允许更新IP
+                        if sw_id == new_dpid and port == new_port:
                             if h[1] != ip:
                                 if self.host_migration_log_enable:
                                     self.logger.info("【更新IP】MAC=%s, 旧IP=%s -> 新IP=%s, dpid=%s, port=%s",
                                                    mac, h[1], ip, sw_id, port)
                                 h[1] = ip
+                            return
+                        else:
+                            # 🔧 不同位置：忽略，不允许迁移（防止环路导致的误学习）
+                            if self.host_migration_log_enable:
+                                self.logger.debug("【忽略迁移】MAC=%s, IP=%s, 已存在于 dpid=%s, port=%s, 忽略新位置 dpid=%s, port=%s",
+                                               mac, ip, sw_id, port, new_dpid, new_port)
+                            return
                             return
 
     def _cleanup_pending_host_learning(self):
